@@ -1,5 +1,6 @@
 #include <limits.h>
 #include <ctype.h>
+#include <avr/pgmspace.h>
 
 // https://github.com/jcw/ethercard
 #include <EtherCard.h>
@@ -8,33 +9,61 @@
 #include "Crypto/SHA256.h"
 #include "Crypto/RNG.h"
 
-static byte mac[] = { 0x30, 0xd2, 0x7d, 0x04, 0x93, 0x0d };
-static byte ip[] = { 18, 102, 218, 11 };
-static byte gateway[] = { 18, 102, 218, 1 };
+// Use reboot.py to generate the password hash and the salt.
 
 #define HOSTNAME "soba.mit.edu"
+#define ETHERNET_CS_PIN 10
+const static byte mac[] = { 0x30, 0xd2, 0x7d, 0x04, 0x93, 0x0d };
+const static byte ip[] = { 18, 102, 218, 11 };
+const static byte gateway[] = { 18, 102, 218, 1 };
+byte Ethernet::buffer[512];
+static BufferFiller bfill;
+static char *rxdata;
+static uint16_t rxdata_len;
+
 #define RNG_EEPROM_ADDR 0
 
-byte Ethernet::buffer[512];
-BufferFiller bfill;
-char *rxdata;
-uint16_t rxdata_len;
+#define CHALLENGE_EXPIRY 30000 // 30 seconds
+#define CHALLENGE_SIZE 32
+static uint8_t challenge[CHALLENGE_SIZE];
+static char challenge_hex[2*CHALLENGE_SIZE + 1];
+static long challenge_issued;
+static bool challenge_valid = false;
 
-void fail() {
+static uint8_t expected_hash[CHALLENGE_SIZE];
+static uint8_t actual_hash[CHALLENGE_SIZE];
+
+#define SWITCH_PIN 19 // pin A5
+static uint8_t press_length;
+
+static const char get_challenge_route[] PROGMEM = "GET /challenge";
+static const char post_reboot_route[] PROGMEM = "POST /reboot/"; // POST /reboot/[SHA256(password_hash || challenge)]
+
+static SHA256 sha256;
+
+static void fail() {
   while (1);
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
+
+  // pins
+  digitalWrite(SWITCH_PIN, HIGH);
+  pinMode(SWITCH_PIN, OUTPUT);
 
   // RNG
+  Serial.println(F("Generating entropy."));
   RNG.begin(HOSTNAME, RNG_EEPROM_ADDR);
+  // wait for some initial entropy
+  while (!RNG.available(CHALLENGE_SIZE))
+    RNG.loop();
 
   // Ethernet
-  byte firmwareVersion = ether.begin(sizeof Ethernet::buffer, mac, 10);
+  byte firmware_version = ether.begin(sizeof Ethernet::buffer, mac, ETHERNET_CS_PIN);
   Serial.print("Firmware version: ");
-  Serial.println(firmwareVersion);
-  if (firmwareVersion == 0)
+  Serial.println(firmware_version);
+  if (firmware_version == 0)
   {
     Serial.println(F("Failed to access Ethernet controller"));
     fail();
@@ -44,7 +73,7 @@ void setup() {
   ether.printIp("Gateway: ", ether.gwip);
 }
 
-static void toHex(uint8_t *in, char *out, size_t nbytes) {
+static void to_hex(uint8_t *in, char *out, size_t nbytes) {
   for (int i = 0; i < nbytes; i++) {
     uint8_t upper = in[i] >> 4;
     out[2*i] = upper < 10 ? upper + '0' : upper - 10 + 'a';
@@ -54,7 +83,7 @@ static void toHex(uint8_t *in, char *out, size_t nbytes) {
   out[2*nbytes] = '\0';
 }
 
-static void fromHex(char *in, uint8_t *out, size_t nbytes) {
+static void from_hex(char *in, uint8_t *out, size_t nbytes) {
   for (int i = 0; i < nbytes; i++) {
     uint8_t upper = isalpha(in[2*i]) ? in[2*i] - 'a' + 10 : in[2*i] - '0';
     uint8_t lower = isalpha(in[2*i+1]) ? in[2*i+1] - 'a' + 10 : in[2*i+1] - '0';
@@ -62,57 +91,41 @@ static void fromHex(char *in, uint8_t *out, size_t nbytes) {
   }
 }
 
-uint8_t challenge[16];
-char challengeHex[33];
-uint8_t challengeTest[16];
-long challengeIssued;
-bool challengeValid = false;
-const long challengeExpiry = 3000000; // 30 seconds
-
-const char passwordHash[16] = "password1234";
-
-static void generateChallenge() {
+static word handle_get_challenge() {
   long now = millis();
-  if (challengeValid && now - challengeIssued < challengeExpiry) {
+  if (challenge_valid && now - challenge_issued < CHALLENGE_EXPIRY) {
     Serial.println(F("Reusing challenge."));
   } else {
     Serial.print(F("Generating challenge: "));
-    challengeIssued = now;
-    challengeValid = true;
+    challenge_issued = now;
+    challenge_valid = true;
 
-    while (!RNG.available(sizeof(challenge)))
-      RNG.loop();
+    // This is sufficient (combined with the initial RNG seeding)
+    // to ensure challenges have a very low probability of being reused
+    // and also that the attacker cannot predict the next challenge.
     RNG.rand(challenge, sizeof(challenge));
-    toHex(challenge, challengeHex, sizeof(challenge));
+    // This isn't really necessary, but just in case.
+    sha256.reset();
+    sha256.update(challenge, sizeof(challenge));
+    sha256.finalize(challenge, sizeof(challenge));
+    to_hex(challenge, challenge_hex, sizeof(challenge));
 
-    Serial.println(challengeHex);
+    Serial.println(challenge_hex);
   }
-}
-
-const char *getPrefix = "GET /";
-const char *postPrefix = "POST /";
-
-static word handleGet() {
-  Serial.println(F("GET Request."));
-
-  generateChallenge();
 
   bfill = ether.tcpOffset();
   bfill.emit_p(PSTR(
-    "HTTP/1.1 302 Found\r\n"
+    "HTTP/1.1 200 OK\r\n"
     "Cache-Control: no-cache\r\n"
-    "Location: http://dpchen.me/reboot/form?challenge=$S\r\n"
+    "Content-Type: application/json\r\n"
     "\r\n"
-  ), challengeHex);
+    "{\"challenge\": \"$S\", \"salt\": \"" PASSWORD_SALT_HEX "\"}"
+  ), challenge_hex);
   Serial.println(F("Request completed."));
   return bfill.position();
 }
 
-SHA256 sha256;
-uint8_t expectedHash[16];
-uint8_t actualHash[16];
-
-static void badRequest() {
+static void bad_request() {
   bfill.emit_p(PSTR(
     "HTTP/1.1 400 Bad Request\r\n"
     "Cache-Control: no-cache\r\n"
@@ -131,32 +144,35 @@ static void forbidden() {
 }
 
 static void reboot() {
-  // press power button for 5 seconds
-  Serial.println(F("Pressing power button."));
-  delay(5000);
+  Serial.print(F("Pressing power button for "));
+  Serial.print(press_length);
+  Serial.println(F(" seconds."));
+  digitalWrite(SWITCH_PIN, LOW);
+  delay(press_length * 1000L);
+  digitalWrite(SWITCH_PIN, HIGH);
   Serial.println(F("Unpressing power button."));
 }
 
-static word handlePost() {
-  Serial.println(F("Request received."));
-
+static word handle_post_reboot() {
   // compute expected hash
   sha256.reset();
-  sha256.update(passwordHash, sizeof(passwordHash));
+  sha256.update(password_hash, sizeof(password_hash));
   sha256.update(challenge, sizeof(challenge));
-  sha256.finalize(expectedHash, sizeof(expectedHash));
+  sha256.finalize(expected_hash, sizeof(expected_hash));
 
-  // check against actual hash
-  char *remaining = rxdata + strlen(postPrefix);
-  uint16_t remaining_len = rxdata_len - strlen(postPrefix);
-  if (remaining_len < sizeof(expectedHash)*2) {
-    badRequest();
+  char *remaining = rxdata + strlen(post_reboot_route);
+  uint16_t remaining_len = rxdata_len - strlen(post_reboot_route);
+
+  // check length
+  if (remaining_len < sizeof(expected_hash)*2 + 3) {
+    bad_request();
     return bfill.position();
   }
 
-  fromHex(remaining, actualHash, sizeof(actualHash));
-  for (int i = 0; i < sizeof(expectedHash); i++) {
-    if (actualHash[i] != expectedHash[i]) {
+  // check against actual hash
+  from_hex(remaining, actual_hash, sizeof(actual_hash));
+  for (int i = 0; i < sizeof(expected_hash); i++) {
+    if (actual_hash[i] != expected_hash[i]) {
       forbidden();
       return bfill.position();
     }
@@ -164,26 +180,43 @@ static word handlePost() {
 
   // check expiry
   long now = millis();
-  if (!challengeValid || now - challengeIssued >= challengeExpiry) {
+  if (!challenge_valid || now - challenge_issued >= CHALLENGE_EXPIRY) {
     Serial.println(F("Challenge invalid/expired."));
     forbidden();
     return bfill.position();
   }
   // invalidate challenge
-  challengeValid = false;
+  challenge_valid = false;
 
-  reboot();
+  // get the press length
+  remaining += sizeof(expected_hash) * 2 + 1;
+  remaining_len -= sizeof(expected_hash) * 2 + 1;
+  if (remaining_len < 2) {
+    bad_request();
+    return bfill.position();
+  }
+  // read the length
+  from_hex(remaining, &press_length, sizeof(press_length));
 
   bfill.emit_p(PSTR(
-    "HTTP/1.1 200 OK\r\n"
+    "HTTP/1.1 204 No Content\r\n"
     "Cache-Control: no-cache\r\n"
-    "\r\n"
-    "<html><body>Rebooted.</body></html>\r\n"
     "\r\n"
   ));
 
   Serial.println(F("Request completed."));
   return bfill.position();
+}
+
+// requires a flash string
+static bool match_route(const char *route) {
+  int route_len = strlen_P(route);
+  bool ret = rxdata_len >= route_len && strncmp_P(rxdata, route, route_len) == 0;
+  if (ret) {
+    Serial.print("Matched route ");
+    Serial.println((const __FlashStringHelper *) route);
+  }
+  return ret;
 }
 
 void loop() {
@@ -197,8 +230,8 @@ void loop() {
     long now = millis();
     // protect against overflow by invalidating whenever now is before the
     // challenge was issued
-    if (now - challengeIssued >= challengeExpiry || now < challengeIssued) {
-      challengeValid = false;
+    if (now - challenge_issued >= CHALLENGE_EXPIRY || now < challenge_issued) {
+      challenge_valid = false;
     }
 
     // help the RNG a bit, but don't give it entropy credit
@@ -208,13 +241,20 @@ void loop() {
     rxdata_len = len - pos;
     bfill = ether.tcpOffset();
     word txpos;
-    if (rxdata_len >= strlen(getPrefix) && strncmp(getPrefix, rxdata, strlen(getPrefix)) == 0) {
-      txpos = handleGet();
-    } else if (rxdata_len >= strlen(postPrefix) && strncmp(postPrefix, rxdata, strlen(postPrefix)) == 0) {
-      txpos = handlePost();
+    if (match_route(get_challenge_route)) {
+      txpos = handle_get_challenge();
+    } else if (match_route(post_reboot_route)) {
+      txpos = handle_post_reboot();
+    } else {
+      return;
     }
     ether.httpServerReply(txpos); // send web page data
     pos = 0;
+  }
+
+  if (press_length > 0) {
+    reboot();
+    press_length = 0;
   }
 }
 
