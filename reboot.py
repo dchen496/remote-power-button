@@ -17,6 +17,10 @@ def hash_password(pw, salt=None):
 
 def print_password_hash():
     pw = getpass.getpass()
+    confirm = getpass.getpass()
+    if pw != confirm:
+        print 'passwords do not match'
+        return
     h, salt = hash_password(pw)
     hash_hex = ', '.join([ '0x'+b.encode('hex') for b in h ])
     print 'static const char password_hash[{}] = {{ {} }};'.format(len(h), hash_hex)
@@ -47,7 +51,7 @@ def main():
     parser.add_argument('-p, --password-hash', help='Generate password hash.',
             dest='hash_password', action='store_true')
     parser.add_argument('-l, --length', help='Time to press power button (in seconds)',
-            dest='length', type=int, default='5')
+            dest='length', type=int, default='1')
     args = parser.parse_args()
     if args.hash_password:
         print_password_hash()
