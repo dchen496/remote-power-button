@@ -52,9 +52,13 @@ def main():
             dest='hash_password', action='store_true')
     parser.add_argument('-l, --length', help='Time to press power button (in seconds)',
             dest='length', type=int, default='1')
+    parser.add_argument('-t, --test', help='Test remote endpoint',
+            dest='test', action='store_true')
     args = parser.parse_args()
     if args.hash_password:
         print_password_hash()
+    elif test:
+        test()
     else:
         reboot(args.length)
 
